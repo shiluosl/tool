@@ -83,14 +83,15 @@ select_interface() {
 
 # ---------------------- 核心功能 ----------------------
 add_rule() {
-    # 协议选择
-    read -rp "协议类型 [tcp/udp] (默认tcp): " protocol
-    protocol=${protocol:-tcp}
-    [[ $protocol != "tcp" && $protocol != "udp" ]] && protocol="tcp"
+    # 协议选择（已修改默认值）
+    read -rp "协议类型 [tcp/udp] (默认udp): " protocol
+    protocol=${protocol:-udp}
+    [[ $protocol != "tcp" && $protocol != "udp" ]] && protocol="udp"
 
-    # 源端口范围
+    # 源端口范围（已添加默认值）
     while true; do
-        read -rp "源端口范围（格式 开始:结束，如5000:6000）: " source_range
+        read -rp "源端口范围（格式 开始:结束，默认50000:65535）: " source_range
+        source_range=${source_range:-50000:65535}
         if [[ $source_range =~ ^[0-9]+:[0-9]+$ ]]; then
             start_port=${source_range%%:*}
             end_port=${source_range##*:}
@@ -100,7 +101,7 @@ add_rule() {
                 echo -e "${RED}错误：起始端口必须小于结束端口！${RESET}"
             fi
         else
-            echo -e "${RED}格式错误！正确示例：5000:6000${RESET}"
+            echo -e "${RED}格式错误！正确示例：50000:65535${RESET}"
         fi
     done
 
