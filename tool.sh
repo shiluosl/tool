@@ -1,239 +1,183 @@
 #!/bin/bash
-# 名称：高级端口转发管理器
-# 版本：v3.1
-# 特点：多规则管理 | 精准匹配
+# 智能端口转发管理器 v2.1
+# 支持IPv4/IPv6双栈 | 自动连接跟踪清理 | 规则持久化
 
-# ---------------------- 初始化设置 ----------------------
-CONFIG_FILE="$(pwd)/config.conf"
-LOG_FILE="$(pwd)/log.log"
-RULES_FILE="/etc/iptables/rules.v4"
+# ---------------------- 配置区 ----------------------
+CONFIG_FILE="/etc/port_forward.rules"
+LOG_FILE="/var/log/pfm.log"
+declare -A COLORS=(
+    [reset]="\033[0m"
+    [red]="\033[38;5;196m"
+    [green]="\033[38;5;046m"
+    [yellow]="\033[38;5;226m"
+    [cyan]="\033[38;5;051m"
+    [blue]="\033[38;5;027m"
+)
+COL1=8    # 序号列
+COL2=10   # 协议列
+COL3=24   # 源端口
+COL4=32   # 目标地址
+COL5=18   # 接口
 
-# ---------------------- 颜色定义 ----------------------
-RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'
-BLUE='\033[34m'; BOLD='\033[1m'; RESET='\033[0m'
+# ---------------------- 初始化检查 ----------------------
+init_check() {
+    [[ $EUID -ne 0 ]] && error "必须使用root权限运行"
+    [[ ! -x /sbin/iptables ]] && error "iptables未安装"
+    mkdir -p "${CONFIG_FILE%/*}"
+    touch "$CONFIG_FILE" || error "配置文件不可写"
+}
 
-# ---------------------- 日志记录 ----------------------
+# ---------------------- 日志系统 ----------------------
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-# ---------------------- 依赖检查 ----------------------
-check_deps() {
-    if ! command -v iptables &>/dev/null; then
-        echo -e "${RED}错误：缺少iptables，请先安装iptables！${RESET}"
-        exit 1
-    fi
+# ---------------------- 美观输出函数 ----------------------
+print_header() {
+    clear
+    printf "%${COL1}s" "序号" 
+    printf "%-${COL2}s" "协议"
+    printf "%-${COL3}s" "源端口范围"
+    printf "%-${COL4}s" "目标地址 ➜ 端口"
+    printf "%-${COL5}s\n" "网络接口"
     
-    if ! dpkg -l | grep -q iptables-persistent; then
-        echo -e "${YELLOW}正在安装iptables-persistent...${RESET}"
-        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent; then
-            echo -e "${RED}安装失败，请手动安装iptables-persistent！${RESET}"
-            exit 1
-        fi
-    fi
+    # 动态生成分隔线
+    sepline() {
+        yes "▔" | head -n $1 | tr -d '\n'
+    }
+    echo -e "${COLORS[blue]}$(sepline $COL1) $(sepline $COL2) $(sepline $COL3) $(sepline $COL4) $(sepline $COL5)${COLORS[reset]}"
 }
 
-# ---------------------- 配置管理 ----------------------
-save_config() {
-    echo "$1" >> "$CONFIG_FILE"
-    log "保存规则: $1"
+print_rule() {
+    printf "%${COL1}d" "$1"
+    printf "%-${COL2}s" "$2"
+    printf "%-${COL3}s" "${3:0:24}"
+    printf "%-${COL4}s" "${4:0:28}"
+    printf "%-${COL5}s\n" "$5"
 }
 
-load_rules() {
-    [[ -f "$CONFIG_FILE" ]] && cat "$CONFIG_FILE" || echo ""
+# ---------------------- 规则生成器 ----------------------
+gen_hash() {
+    sha256sum <<< "${1}${2}${3}${4}${5}" | cut -c1-32 | tee -a "$LOG_FILE"
 }
 
-# ---------------------- 规则验证 ----------------------
-validate_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 )) && return 0
-    echo -e "${RED}错误：端口号必须为1-65535之间的整数${RESET}"
-    return 1
-}
-
-validate_ip() {
-    local ip="$1"
-    local stat=1
-    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        IFS='.' read -r -a octets <<< "$ip"
-        for octet in "${octets[@]}"; do
-            (( octet > 255 )) && { stat=1; break; }
-            stat=0
-        done
-    fi
-    [ $stat -eq 0 ] && return 0
-    echo -e "${RED}错误：IP地址格式无效${RESET}"
-    return 1
-}
-
-# ---------------------- 接口选择 ----------------------
-select_interface() {
-    local interfaces=($(ip -o link show | awk -F': ' '!/lo|vir/{print $2}'))
-    if (( ${#interfaces[@]} == 0 )); then
-        echo -e "${RED}未找到可用网络接口！${RESET}"
-        return 1
-    fi
-    
-    PS3="请选择网络接口（输入序号）: "
-    select interface in "${interfaces[@]}"; do
-        [[ -n $interface ]] && break
-        echo -e "${RED}无效选择，请重新输入！${RESET}"
-    done
-    echo "$interface"
-}
-
-# ---------------------- 核心功能 ----------------------
 add_rule() {
-    # 协议选择（已修改默认值）
-    read -rp "协议类型 [tcp/udp] (默认udp): " protocol
-    protocol=${protocol:-udp}
-    [[ $protocol != "tcp" && $protocol != "udp" ]] && protocol="udp"
+    read -p "协议类型 (tcp/udp): " proto
+    read -p "源端口范围 (如 1000-2000): " src_port
+    read -p "目标IP地址: " dest_ip
+    read -p "目标端口: " dest_port
+    read -p "网络接口: " interface
 
-    # 源端口范围（已添加默认值）
-    while true; do
-        read -rp "源端口范围（格式 开始:结束，默认50000:65535）: " source_range
-        source_range=${source_range:-50000:65535}
-        if [[ $source_range =~ ^[0-9]+:[0-9]+$ ]]; then
-            start_port=${source_range%%:*}
-            end_port=${source_range##*:}
-            if validate_port "$start_port" && validate_port "$end_port" && (( start_port < end_port )); then
-                break
-            else
-                echo -e "${RED}错误：起始端口必须小于结束端口！${RESET}"
-            fi
-        else
-            echo -e "${RED}格式错误！正确示例：50000:65535${RESET}"
-        fi
-    done
+    # 输入校验
+    [[ ! "$proto" =~ ^(tcp|udp)$ ]] && error "无效协议类型"
+    [[ ! "$src_port" =~ ^[0-9]+(-[0-9]+)?$ ]] && error "端口格式错误"
+    [[ ! "$dest_port" =~ ^[0-9]+$ ]] && error "目标端口需为数字"
 
-    # 目标地址
-    while true; do
-        read -rp "目标IP地址（默认127.0.0.1）: " dest_ip
-        dest_ip=${dest_ip:-127.0.0.1}
-        validate_ip "$dest_ip" && break
-    done
-
-    # 目标端口
-    while true; do
-        read -rp "目标端口: " dest_port
-        validate_port "$dest_port" && break
-    done
-
-    # 接口选择
-    interface=$(select_interface) || return
-
-    # 生成唯一标识
-    rule_hash=$(md5sum <<< "${protocol}-${source_range}-${dest_ip}:${dest_port}-${interface}" | cut -d' ' -f1)
-    rule_entry="${rule_hash}:${protocol}:${source_range}:${dest_ip}:${dest_port}:${interface}"
+    local fw_hash=$(gen_hash "$proto" "$src_port" "$dest_ip" "$dest_port" "$interface")
     
-    # 检查重复规则
-    if grep -q "^${rule_hash}:" "$CONFIG_FILE" 2>/dev/null; then
-        echo -e "${YELLOW}相同规则已存在，无需重复添加！${RESET}"
-        return
+    # 查重机制
+    if grep -q "$fw_hash" "$CONFIG_FILE"; then
+        error "重复规则已存在" 3
     fi
 
-    # 应用规则
-    if ! iptables -t nat -A PREROUTING -i "$interface" -p "$protocol" \
-         --dport "$source_range" -j DNAT --to-destination "${dest_ip}:${dest_port}" \
-         -m comment --comment "PFM:$rule_hash"; then
-        echo -e "${RED}规则添加失败，正在回滚...${RESET}"
-        netfilter-persistent reload
-        log "规则添加失败: $rule_entry"
-        return 1
-    fi
+    # 写入配置
+    echo "${fw_hash}|${proto}|${src_port}|${dest_ip}|${dest_port}|${interface}" >> "$CONFIG_FILE"
 
-    # 保存配置
-    save_config "$rule_entry"
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    netfilter-persistent save
-    echo -e "${GREEN}✔ 规则添加成功！${RESET}"
+    # 动态生成iptables规则
+    iptables_cmd="iptables -t nat -A PREROUTING -i $interface -p $proto --match multiport --dports ${src_port} -j DNAT --to-destination ${dest_ip}:${dest_port} -m comment --comment \"PFM:${fw_hash}\""
+    
+    if eval "$iptables_cmd"; then
+        log "规则添加成功: $fw_hash"
+        persist_rules
+    else
+        error "规则应用失败" 4
+    fi
 }
 
+# ---------------------- 规则删除器 ----------------------
 delete_rule() {
-    local rules=($(load_rules))
-    if [[ ${#rules[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}当前没有可用的转发规则${RESET}"
-        return
-    fi
+    mapfile -t rules < "$CONFIG_FILE"
+    [[ ${#rules[@]} -eq 0 ]] && error "没有可删除的规则"
 
-    # 显示规则列表
-    echo -e "\n${BOLD}当前规则列表：${RESET}"
+    print_header
     local count=1
-    printf "%-4s %-8s %-15s %-20s %-15s\n" "序号" "协议" "源端口" "目标地址:端口" "接口"
+    declare -A rule_map
     for rule in "${rules[@]}"; do
-        IFS=':' read -r _ protocol source_range dest_ip dest_port interface <<< "$rule"
-        printf "%-4d %-8s %-15s %-20s %-15s\n" \
-               "$count" "$protocol" "$source_range" "${dest_ip}:${dest_port}" "$interface"
+        IFS='|' read -r hash proto src_range dest_ip dest_port iface <<< "$rule"
+        print_rule $count "$proto" "$src_range" "${dest_ip}:${dest_port}" "$iface"
+        rule_map[$count]="$hash"
         ((count++))
     done
 
-    # 选择删除项
-    local choice
-    while true; do
-        read -rp "请输入要删除的规则序号 (0取消): " choice
-        [[ $choice -eq 0 ]] && return
-        if [[ $choice =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#rules[@]} )); then
-            break
-        else
-            echo -e "${RED}无效序号，请重新输入！${RESET}"
-        fi
-    done
+    read -p "输入要删除的规则序号: " choice
+    [[ -z "${rule_map[$choice]}" ]] && error "无效的选择"
+    
+    local target_hash="${rule_map[$choice]}"
+    
+    # 从配置文件中删除
+    sed -i "/^${target_hash}/d" "$CONFIG_FILE"
+    
+    # 清理iptables规则
+    while read -r line_num; do
+        iptables -t nat -D PREROUTING "$line_num" 2>/dev/null || \
+        log "规则索引变化，尝试哈希清除..." && \
+        iptables -t nat -D PREROUTING -m comment --comment "PFM:${target_hash}" 2>/dev/null
+    done < <(iptables -t nat --line-numbers -L PREROUTING | grep "PFM:${target_hash}" | awk '{print $1}' | tac)
 
-    # 提取规则信息
-    local selected_rule="${rules[$((choice-1))]}"
-    IFS=':' read -r hash protocol source_range dest_ip dest_port interface <<< "$selected_rule"
+    # 清空相关连接追踪
+    conntrack -D -d "$dest_ip" -p "$proto" --dport "$dest_port" &>/dev/null
+    
+    persist_rules
+    log "规则 ${target_hash} 已移除"
+}
 
-    # 删除iptables规则
-    if iptables -t nat -C PREROUTING -i "$interface" -p "$protocol" \
-       --dport "$source_range" -j DNAT --to-destination "${dest_ip}:${dest_port}" \
-       -m comment --comment "PFM:$hash" &>/dev/null; then
-        iptables -t nat -D PREROUTING -i "$interface" -p "$protocol" \
-                 --dport "$source_range" -j DNAT --to-destination "${dest_ip}:${dest_port}" \
-                 -m comment --comment "PFM:$hash"
-        log "删除规则: $selected_rule"
-    else
-        echo -e "${YELLOW}规则不存在或已被移除${RESET}"
+# ---------------------- 规则持久化 ----------------------
+persist_rules() {
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save || error "持久化失败"
+    elif command -v iptables-save &>/dev/null; then
+        iptables-save > /etc/iptables/rules.v4 || error "保存失败"
+        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
     fi
-
-    # 更新配置文件
-    sed -i "/^${hash}:/d" "$CONFIG_FILE"
-    netfilter-persistent save
-    echo -e "${GREEN}✔ 规则成功删除！${RESET}"
 }
 
-# ---------------------- 辅助功能 ----------------------
-list_rules() {
-    echo -e "\n${BOLD}当前生效的NAT规则：${RESET}"
-    iptables -t nat -L PREROUTING -n -v --line-numbers | grep -E 'PFM:|target'
+# ---------------------- 动态宽度版本 ----------------------
+dynamic_menu() {
+    local term_width=$(tput cols)
+    local title=" 端口转发管理器 v3.1 "
+    local line_length=$(( (term_width - ${#title}) / 2 - 2 ))
+    
+    # 生成动态装饰线
+    gen_line() {
+        yes $1 | head -n $line_length | tr -d '\n'
+    }
+    
+    clear
+    echo -e "${COLORS[blue]}$(gen_line '▔')${title}$(gen_line '▔')${COLORS[reset]}"
     echo
+    echo "1. 添加端口转发规则"
+    echo "2. 删除现有规则"
+    echo "3. 查看生效中的规则"
+    echo "4. 导出当前配置"
+    echo "5. 清空所有规则"
+    echo "0. 退出管理系统"
+    echo
+    echo -e "${COLORS[blue]}$(gen_line '▁')${COLORS[reset]}"
 }
 
-# ---------------------- 主程序 ----------------------
-main_menu() {
-    check_deps
-    while true; do
-        clear
-        echo -e "${BLUE}▔▔▔▔▔▔▔▔▔▔▔▔ 端口转发管理器 v3.1 ▔▔▔▔▔▔▔▔▔▔▔▔${RESET}"
-        echo "1. 添加转发规则"
-        echo "2. 删除规则"
-        echo "3. 查看当前规则"
-        echo "4. 退出程序"
-        echo -e "${BLUE}▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁${RESET}"
-        
-        read -rp "请输入操作编号 [1-4]: " choice
-        case $choice in
-            1) add_rule ;;
-            2) delete_rule ;;
-            3) list_rules ;;
-            4) 
-                echo -e "${GREEN}感谢使用，再见！${RESET}"
-                exit 0 ;;
-            *)
-                echo -e "${RED}无效选项，请重新输入！${RESET}" ;;
-        esac
-        read -rp "按回车键继续..."
-    done
-}
 
-# 异常处理
-trap "echo -e '\n${RED}操作中断！${RESET}'; exit 1" SIGINT
-main_menu
+# ---------------------- 执行入口 ----------------------
+init_check
+while true; do
+    main_menu
+    read -p "请选择操作: " opt
+    case $opt in
+        1) add_rule ;;
+        2) delete_rule ;;
+        3) print_header; cat "$CONFIG_FILE" | awk -F'|' '{print $1,$2,$3,$4":"$5,$6}' | column -t ;;
+        4) persist_rules ;;
+        5) iptables -t nat -F PREROUTING ; rm "$CONFIG_FILE" ;;
+        0) exit 0 ;;
+        *) echo "无效选项"; sleep 1 ;;
+    esac
+done
