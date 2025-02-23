@@ -10,7 +10,7 @@ MAX_RETRY=3
 LOG_FILE="/var/log/port_forward.log"
 
 # ---------------------- 权限检查 ----------------------
-if [[ $EUID -ne  ]]; then
+if [[ $EUID -ne 0 ]]; then
     echo -e "\033[31m错误：必须使用 root 权限运行此脚本！\033[0m" >&2
     exit 1
 fi
