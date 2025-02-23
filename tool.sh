@@ -1,12 +1,12 @@
 #!/bin/bash
 # 名称：高级端口转发管理器
 # 版本：v3.1
-# 特点：多规则管理 | 精准匹配 | 流量监控
+# 特点：多规则管理 | 精准匹配
 
 # ---------------------- 初始化设置 ----------------------
-CONFIG_FILE="/etc/port_forward_rules.conf"
+CONFIG_FILE="$(pwd)/config.conf"
+LOG_FILE="$(pwd)/log.log"
 RULES_FILE="/etc/iptables/rules.v4"
-LOG_FILE="/var/log/port_forward.log"
 
 # ---------------------- 颜色定义 ----------------------
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'
@@ -206,12 +206,6 @@ list_rules() {
     echo
 }
 
-traffic_dashboard() {
-    echo -e "${BOLD}启动实时流量监控...${RESET}"
-    echo -e "${YELLOW}按 Ctrl+C 返回菜单${RESET}"
-    watch -n1 "iptables -t nat -L PREROUTING -n -v | grep 'PFM:'"
-}
-
 # ---------------------- 主程序 ----------------------
 main_menu() {
     check_deps
@@ -221,17 +215,15 @@ main_menu() {
         echo "1. 添加转发规则"
         echo "2. 删除规则"
         echo "3. 查看当前规则"
-        echo "4. 流量统计面板"
-        echo "5. 退出程序"
+        echo "4. 退出程序"
         echo -e "${BLUE}▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁${RESET}"
         
-        read -rp "请输入操作编号 [1-5]: " choice
+        read -rp "请输入操作编号 [1-4]: " choice
         case $choice in
             1) add_rule ;;
             2) delete_rule ;;
             3) list_rules ;;
-            4) traffic_dashboard ;;
-            5) 
+            4) 
                 echo -e "${GREEN}感谢使用，再见！${RESET}"
                 exit 0 ;;
             *)
